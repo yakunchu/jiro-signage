@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ジロー薬局 サイネージ</title>
+<style>
+  /* 色は仮。正式なスライドの見た目は Claude Design（ジローブルー）で作って画像で差し込む */
+  :root {
+    --ai: #1f3f74;        /* 藍 */
+    --ai-deep: #132a52;
+    --ai-soft: #e9eef7;
+    --ink: #17202e;
+    --white: #ffffff;
+    --mark: #f3c623;      /* 強調の黄 */
+    --urgent: #b3261e;
+  }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden; cursor: none;
+    background: #000; color: var(--ink);
+    font-family: "Noto Sans JP", "Noto Sans CJK JP", "Hiragino Sans", "Yu Gothic UI", "Meiryo", sans-serif;
+  }
+  #stage { position: fixed; inset: 0 0 9vh 0; background: #000; }
+  .slide {
+    position: absolute; inset: 0; opacity: 0; transition: opacity 0.9s ease;
+    display: flex; flex-direction: column; justify-content: center;
+    padding: 0 7vw; box-sizing: border-box;
+  }
+  .slide.show { opacity: 1; }
+  .slide.media { padding: 0; align-items: center; background: #000; }
+  .slide.media img, .slide.media video { width: 100%; height: 100%; object-fit: contain; }
+  .slide.media.cover img, .slide.media.cover video { object-fit: cover; }
+
+  /* 文字スライドのテーマ */
+  .theme-ai    { background: var(--ai); color: var(--white); }
+  .theme-light { background: var(--ai-soft); color: var(--ai-deep); }
+  .theme-urgent{ background: var(--white); color: var(--ink); border-top: 3.2vh solid var(--urgent); }
+  .label {
+    align-self: flex-start; font-size: 3.6vh; font-weight: 700; letter-spacing: 0.1em;
+    padding: 0.5vh 1.6vh; margin-bottom: 3vh; border-radius: 0.6vh;
+    background: var(--mark); color: var(--ai-deep);
+  }
+  .theme-urgent .label { background: var(--urgent); color: var(--white); }
+  .title { font-size: 9vh; font-weight: 800; line-height: 1.25; margin: 0 0 4vh; white-space: pre-line; }
+  .body  { font-size: 5.4vh; font-weight: 500; line-height: 1.6; margin: 0; padding: 0; list-style: none; }
+  .body li + li { margin-top: 1.2vh; }
+  .note  { font-size: 3.2vh; margin-top: 4vh; opacity: 0.8; }
+
+  /* 下の帯（時計・お知らせ） */
+  #bar {
+    position: fixed; left: 0; right: 0; bottom: 0; height: 9vh; box-sizing: border-box;
+    display: flex; align-items: center; gap: 3vw; padding: 0 3vw;
+    background: var(--ai-deep); color: var(--white); font-size: 3.6vh; white-space: nowrap;
+  }
+  #name { font-weight: 800; letter-spacing: 0.08em; }
+  #ticker { flex: 1; overflow: hidden; text-overflow: ellipsis; opacity: 0.9; }
+  #clock { font-variant-numeric: tabular-nums; font-weight: 700; }
+
+  /* プレビュー用の表示（?debug=1 のときだけ） */
+  #debug {
+    position: fixed; top: 1vh; left: 1vh; z-index: 9; display: none;
+    background: rgba(0,0,0,0.7); color: #0f0; font: 2vh/1.4 monospace; padding: 0.6vh 1vh;
+  }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<div id="bar"><span id="name"></span><span id="ticker"></span><span id="clock"></span></div>
+<div id="debug"></div>
+
+<script>
+(() => {
+  "use strict";
+
+  // ---- URL での確認用スイッチ（Claude がプレビューで使う。店頭では何も付けない）----
+  //   ?at=2026-12-25T10:00  … その日時になったつもりで表示する
+  //   ?only=slide-id        … 1枚だけ表示する
+  //   ?fast=1               … 1枚3秒で回す
+  //   ?debug=1              … 左上に今のスライド名と時刻を出す
+  const q = new URLSearchParams(location.search);
+  const atParam = q.get("at");
+  const offsetMs = atParam ? (new Date(atParam).getTime() - Date.now()) : 0;
+  const now = () => new Date(Date.now() + offsetMs);
+  const ONLY = q.get("only");
+  const FAST = q.get("fast") === "1";
+  const DEBUG = q.get("debug") === "1";
+
+  const DOW = "日月火水木金土";
+  const CACHE_KEY = "jiro-signage-playlist";
+  const stage = document.getElementById("stage");
+  const $ = (id) => document.getElementById(id);
+
+  let playlist = null;       // 今使っている内容
+  let pending = null;        // 取り込み待ちの新しい内容（次の切り替えで反映）
+  let order = [];            // 今回まわす順番
+  let pos = -1;
+  let timer = null;
+  let lastReloadDay = null;
+
+  const pad = (n) => String(n).padStart(2, "0");
+  const ymd = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  const hm = (d) => `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+
+  // ---- 表示してよいスライドかどうか（日付・曜日・時間帯）----
+  function isActive(s, d) {
+    if (s.enabled === false) return false;
+    const day = ymd(d), t = hm(d);
+    if (s.from && day < s.from) return false;
+    if (s.until && day > s.until) return false;
+    if (s.days && !s.days.includes(DOW[d.getDay()])) return false;
+    if (s.time) {
+      const [a, b] = s.time.split("-");
+      if (t < a || t >= b) return false;
+    }
+    return true;
+  }
+
+  // ---- 順番づくり：ふつうのスライドの合間に「急ぎ」を毎回はさむ ----
+  function buildOrder() {
+    const d = now();
+    const list = playlist.slides.filter((s) => isActive(s, d) && (!ONLY || s.id === ONLY));
+    const urgent = list.filter((s) => s.urgent);
+    const normal = list.filter((s) => !s.urgent);
+    if (!normal.length) return urgent;
+    if (!urgent.length) return normal;
+    return normal.flatMap((n) => [n, ...urgent]);
+  }
+
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  }
+
+  // ---- 1枚分の画面をつくる ----
+  function render(s) {
+    const el = document.createElement("div");
+    el.className = "slide";
+    if (s.type === "image" || s.type === "video") {
+      el.classList.add("media");
+      if (s.fit === "cover") el.classList.add("cover");
+      const m = document.createElement(s.type === "image" ? "img" : "video");
+      m.src = s.src;
+      if (s.type === "video") { m.muted = true; m.autoplay = true; m.playsInline = true; }
+      el.appendChild(m);
+      return { el, media: m };
+    }
+    el.classList.add("theme-" + (s.theme || (s.urgent ? "urgent" : "ai")));
+    const body = Array.isArray(s.body) ? s.body : (s.body ? [s.body] : []);
+    el.innerHTML =
+      (s.label ? `<div class="label">${esc(s.label)}</div>` : "") +
+      (s.title ? `<h1 class="title">${esc(s.title)}</h1>` : "") +
+      (body.length ? `<ul class="body">${body.map((b) => `<li>${esc(b)}</li>`).join("")}</ul>` : "") +
+      (s.note ? `<div class="note">${esc(s.note)}</div>` : "");
+    return { el, media: null };
+  }
+
+  function seconds(s) {
+    if (FAST) return 3;
+    return s.seconds || playlist.config.defaultSeconds || 12;
+  }
+
+  // ---- 次のスライドへ ----
+  function next() {
+    clearTimeout(timer);
+    if (pending) { playlist = pending; pending = null; applyConfig(); pos = -1; }
+    if (pos === -1 || pos >= order.length - 1) { order = buildOrder(); pos = -1; }
+    pos++;
+    const s = order[pos];
+    if (!s) { showEmpty(); timer = setTimeout(next, 30000); return; }
+
+    const { el, media } = render(s);
+    let moved = false;
+    const go = () => { if (!moved) { moved = true; next(); } };
+
+    if (media) {
+      // 画像・動画が読めなかったら飛ばす
+      media.addEventListener("error", () => setTimeout(go, 300));
+      if (s.type === "video") media.addEventListener("ended", go);
+    }
+    stage.appendChild(el);
+    void el.offsetWidth; // 一度描かせてからフェードを始める（画面が裏に回っていても止まらない書き方）
+    el.classList.add("show");
+    // 古いスライドはフェードが終わってから片付ける
+    [...stage.children].forEach((c) => { if (c !== el) { c.classList.remove("show"); setTimeout(() => c.remove(), 1000); } });
+
+    // 動画は終わったら次へ。念のため上限時間も置く
+    const limit = s.type === "video" ? (s.seconds || 600) : seconds(s);
+    timer = setTimeout(go, limit * 1000);
+    if (DEBUG) $("debug").textContent = `${s.id}  ${pos + 1}/${order.length}  ${ymd(now())} ${hm(now())}`;
+  }
+
+  function showEmpty() {
+    stage.innerHTML = "";
+    const { el } = render({ theme: "ai", title: playlist ? playlist.config.pharmacyName || "" : "", body: [] });
+    stage.appendChild(el); el.classList.add("show");
+  }
+
+  function applyConfig() {
+    const c = playlist.config || {};
+    $("name").textContent = c.pharmacyName || "";
+    $("ticker").textContent = c.ticker || "";
+  }
+
+  // ---- 内容（playlist.json）の取り込み。失敗したら前回分で続ける ----
+  async function fetchPlaylist() {
+    try {
+      const r = await fetch("playlist.json?t=" + Date.now(), { cache: "no-store" });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const text = await r.text();
+      const data = JSON.parse(text);
+      if (!data || !Array.isArray(data.slides)) throw new Error("slides がありません");
+      try { localStorage.setItem(CACHE_KEY, text); } catch (e) { /* 保存できなくても続ける */ }
+      return data;
+    } catch (e) {
+      console.warn("playlist.json を読めませんでした:", e.message);
+      return null;
+    }
+  }
+
+  function cachedPlaylist() {
+    try { const t = localStorage.getItem(CACHE_KEY); return t ? JSON.parse(t) : null; } catch (e) { return null; }
+  }
+
+  async function refresh() {
+    const data = await fetchPlaylist();
+    if (data && JSON.stringify(data) !== JSON.stringify(playlist)) pending = data;
+  }
+
+  // ---- 時計と、1日1回のページ読み直し（プレーヤー本体の更新を拾うため）----
+  function tick() {
+    const d = now();
+    $("clock").textContent = `${d.getMonth() + 1}月${d.getDate()}日（${DOW[d.getDay()]}）${hm(d)}`;
+    const reloadAt = playlist && playlist.config.reloadAt;
+    if (!atParam && reloadAt && hm(d) === reloadAt && lastReloadDay !== ymd(d)) {
+      lastReloadDay = ymd(d);
+      location.reload();
+    }
+  }
+
+  async function start() {
+    if (DEBUG) $("debug").style.display = "block";
+    playlist = (await fetchPlaylist()) || cachedPlaylist();
+    if (!playlist) {
+      playlist = { config: { pharmacyName: "", defaultSeconds: 12, refreshMinutes: 1 }, slides: [] };
+    }
+    lastReloadDay = ymd(now()); // 起動した日は読み直さない
+    applyConfig();
+    tick();
+    setInterval(tick, 1000 * 15);
+    const every = (playlist.config.refreshMinutes || 5) * 60 * 1000;
+    setInterval(refresh, every);
+    next();
+  }
+
+  start();
+})();
+</script>
+</body>
+</html>
