@@ -2,26 +2,28 @@
   "config": {
     "pharmacyName": "ジロー薬局",
     "ticker": "お薬のことは、お気軽に薬剤師へご相談ください",
+    "version": 2,
+    "player": "2026-11-07b",
     "defaultSeconds": 12,
     "refreshMinutes": 5,
-    "reloadAt": "04:00"
+    "fetchTimeoutSeconds": 10
   },
   "slides": [
     {
       "id": "welcome",
-      "memo": "【仮の文面】常時表示",
+      "memo": "仮の文面。常時表示",
       "type": "text",
       "theme": "ai",
       "label": "ようこそ",
       "title": "ジロー薬局へようこそ",
       "body": [
-        "処方箋をお預かりした順にお呼びします",
+        "お薬の準備ができしだい、お呼びします",
         "お呼びするまで、おかけになってお待ちください"
       ]
     },
     {
       "id": "techo",
-      "memo": "【仮の文面】常時表示",
+      "memo": "仮の文面。常時表示",
       "type": "text",
       "theme": "light",
       "label": "おねがい",
@@ -33,7 +35,7 @@
     },
     {
       "id": "myna",
-      "memo": "【仮の文面】常時表示",
+      "memo": "仮の文面。常時表示",
       "type": "text",
       "theme": "ai",
       "label": "受付",
@@ -45,7 +47,7 @@
     },
     {
       "id": "kaze",
-      "memo": "【仮の文面】季節もの。期間中だけ自動で出る",
+      "memo": "仮の文面。季節もの。期間中だけ自動で出る",
       "type": "text",
       "theme": "light",
       "label": "冬の健康",
@@ -59,7 +61,7 @@
     },
     {
       "id": "saturday",
-      "memo": "【要確認】土曜の受付時間を社長に確認してから文面を入れる。今は出さない設定",
+      "memo": "文面確認待ちのため非表示",
       "enabled": false,
       "type": "text",
       "theme": "light",
@@ -70,7 +72,7 @@
     },
     {
       "id": "nenmatsu",
-      "memo": "【要確認】休業日は仮。確定したら enabled を消す。急ぎ扱い＝ほかのスライドの合間に毎回はさむ。期間が過ぎたら自動で消える",
+      "memo": "日付確認待ちのため非表示。急ぎ扱い（合間に毎回はさむ）。期間が過ぎたら自動で消える",
       "enabled": false,
       "type": "text",
       "urgent": true,

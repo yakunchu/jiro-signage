@@ -20,6 +20,7 @@
     background: #000; color: var(--ink);
     font-family: "Noto Sans JP", "Noto Sans CJK JP", "Hiragino Sans", "Yu Gothic UI", "Meiryo", sans-serif;
   }
+  /* スライドの領域は画面の上 91%（1920×1080 の画面なら 1920×983）。下 9% は時計の帯 */
   #stage { position: fixed; inset: 0 0 9vh 0; background: #000; }
   .slide {
     position: absolute; inset: 0; opacity: 0; transition: opacity 0.9s ease;
@@ -46,7 +47,7 @@
   .body li + li { margin-top: 1.2vh; }
   .note  { font-size: 3.2vh; margin-top: 4vh; opacity: 0.8; }
 
-  /* 下の帯（時計・お知らせ） */
+  /* 下の帯（名前・一言・放送の版と取得時刻・時計） */
   #bar {
     position: fixed; left: 0; right: 0; bottom: 0; height: 9vh; box-sizing: border-box;
     display: flex; align-items: center; gap: 3vw; padding: 0 3vw;
@@ -54,6 +55,7 @@
   }
   #name { font-weight: 800; letter-spacing: 0.08em; }
   #ticker { flex: 1; overflow: hidden; text-overflow: ellipsis; opacity: 0.9; }
+  #status { font-size: 2.4vh; opacity: 0.85; font-variant-numeric: tabular-nums; }
   #clock { font-variant-numeric: tabular-nums; font-weight: 700; }
 
   /* プレビュー用の表示（?debug=1 のときだけ） */
@@ -65,12 +67,16 @@
 </head>
 <body>
 <div id="stage"></div>
-<div id="bar"><span id="name"></span><span id="ticker"></span><span id="clock"></span></div>
+<div id="bar"><span id="name"></span><span id="ticker"></span><span id="status"></span><span id="clock"></span></div>
 <div id="debug"></div>
 
 <script>
 (() => {
   "use strict";
+
+  // プレーヤー本体の版。playlist.json の config.player と同じにする。
+  // 違っていたら、テレビは自動でページを読み直して新しいプレーヤーを取り込む。
+  const PLAYER = "2026-11-07b";
 
   // ---- URL での確認用スイッチ（Claude がプレビューで使う。店頭では何も付けない）----
   //   ?at=2026-12-25T10:00  … その日時になったつもりで表示する
@@ -84,9 +90,16 @@
   const ONLY = q.get("only");
   const FAST = q.get("fast") === "1";
   const DEBUG = q.get("debug") === "1";
+  const PREVIEW = Boolean(atParam || ONLY || FAST || DEBUG);
 
   const DOW = "日月火水木金土";
   const CACHE_KEY = "jiro-signage-playlist";
+  const RELOAD_KEY = "jiro-signage-reloaded-at";
+  const DEFAULTS = { pharmacyName: "", ticker: "", version: 0, defaultSeconds: 12, refreshMinutes: 5, fetchTimeoutSeconds: 10 };
+  const TYPES = ["text", "image", "video"];
+  const reDate = /^\d{4}-\d{2}-\d{2}$/;
+  const reTime = /^(\d{2}):(\d{2})-(\d{2}):(\d{2})$/;
+
   const stage = document.getElementById("stage");
   const $ = (id) => document.getElementById(id);
 
@@ -95,15 +108,53 @@
   let order = [];            // 今回まわす順番
   let pos = -1;
   let timer = null;
-  let lastReloadDay = null;
+  let lastOk = null;         // 最後に内容を取れた時刻
 
   const pad = (n) => String(n).padStart(2, "0");
   const ymd = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
   const hm = (d) => `${pad(d.getHours())}:${pad(d.getMinutes())}`;
 
+  // ---- 内容の点検。おかしいスライドは飛ばし、全体が壊れていれば null（前回分で続ける）----
+  function validTime(t) {
+    const m = reTime.exec(t);
+    if (!m) return false;
+    const a = m[1] + ":" + m[2], b = m[3] + ":" + m[4];
+    return +m[1] < 24 && +m[2] < 60 && +m[3] <= 24 && +m[4] < 60 && a < b; // 日をまたぐ時間帯は使えない
+  }
+  function validSlide(s, seen) {
+    if (!s || typeof s !== "object") return false;
+    if (typeof s.id !== "string" || !s.id || seen.has(s.id)) return false;
+    const type = s.type || "text";
+    if (!TYPES.includes(type)) return false;
+    if (s.seconds !== undefined && !(typeof s.seconds === "number" && s.seconds > 0)) return false;
+    if (s.from !== undefined && !reDate.test(s.from)) return false;
+    if (s.until !== undefined && !reDate.test(s.until)) return false;
+    if (s.from && s.until && s.from > s.until) return false;
+    if (s.days !== undefined && !(typeof s.days === "string" && s.days && [...s.days].every((c) => DOW.includes(c)))) return false;
+    if (s.time !== undefined && !(typeof s.time === "string" && validTime(s.time))) return false;
+    if ((type === "image" || type === "video") && !(typeof s.src === "string" && s.src)) return false;
+    return true;
+  }
+  function normalize(data) {
+    if (!data || typeof data !== "object" || !Array.isArray(data.slides)) return null;
+    const c = Object.assign({}, DEFAULTS, data.config && typeof data.config === "object" ? data.config : {});
+    if (!(c.defaultSeconds > 0)) c.defaultSeconds = DEFAULTS.defaultSeconds;
+    if (!(c.refreshMinutes >= 1)) c.refreshMinutes = DEFAULTS.refreshMinutes;
+    if (!(c.fetchTimeoutSeconds > 0)) c.fetchTimeoutSeconds = DEFAULTS.fetchTimeoutSeconds;
+    const seen = new Set();
+    const slides = [];
+    for (const s of data.slides) {
+      if (validSlide(s, seen)) { seen.add(s.id); slides.push(s); }
+      else console.warn("使えないスライドを飛ばしました:", s && s.id);
+    }
+    if (data.slides.length && !slides.length) return null; // 全部だめなら壊れているとみなす
+    return { config: c, slides };
+  }
+
   // ---- 表示してよいスライドかどうか（日付・曜日・時間帯）----
   function isActive(s, d) {
     if (s.enabled === false) return false;
+    if (ONLY && s.id !== ONLY) return false;
     const day = ymd(d), t = hm(d);
     if (s.from && day < s.from) return false;
     if (s.until && day > s.until) return false;
@@ -118,9 +169,9 @@
   // ---- 順番づくり：ふつうのスライドの合間に「急ぎ」を毎回はさむ ----
   function buildOrder() {
     const d = now();
-    const list = playlist.slides.filter((s) => isActive(s, d) && (!ONLY || s.id === ONLY));
-    const urgent = list.filter((s) => s.urgent);
-    const normal = list.filter((s) => !s.urgent);
+    const list = playlist.slides.filter((s) => isActive(s, d));
+    const urgent = list.filter((s) => s.urgent === true);
+    const normal = list.filter((s) => s.urgent !== true);
     if (!normal.length) return urgent;
     if (!urgent.length) return normal;
     return normal.flatMap((n) => [n, ...urgent]);
@@ -134,12 +185,13 @@
   function render(s) {
     const el = document.createElement("div");
     el.className = "slide";
-    if (s.type === "image" || s.type === "video") {
+    const type = s.type || "text";
+    if (type === "image" || type === "video") {
       el.classList.add("media");
       if (s.fit === "cover") el.classList.add("cover");
-      const m = document.createElement(s.type === "image" ? "img" : "video");
+      const m = document.createElement(type === "image" ? "img" : "video");
+      if (type === "video") { m.muted = true; m.autoplay = true; m.playsInline = true; }
       m.src = s.src;
-      if (s.type === "video") { m.muted = true; m.autoplay = true; m.playsInline = true; }
       el.appendChild(m);
       return { el, media: m };
     }
@@ -155,100 +207,164 @@
 
   function seconds(s) {
     if (FAST) return 3;
-    return s.seconds || playlist.config.defaultSeconds || 12;
+    return s.seconds || playlist.config.defaultSeconds;
+  }
+
+  function retire(c) {
+    c.classList.remove("show");
+    const v = c.querySelector("video");
+    if (v) { v.pause(); v.removeAttribute("src"); v.load(); }
+    setTimeout(() => c.remove(), 1000);
+  }
+
+  // 次に出すスライド。表示する直前にも日付・時間帯を確かめる（期限切れを出さない）
+  function pickNext() {
+    for (let round = 0; round < 2; round++) {
+      while (++pos < order.length) {
+        if (isActive(order[pos], now())) return order[pos];
+      }
+      order = buildOrder();
+      pos = -1;
+    }
+    return null;
   }
 
   // ---- 次のスライドへ ----
   function next() {
     clearTimeout(timer);
-    if (pending) { playlist = pending; pending = null; applyConfig(); pos = -1; }
-    if (pos === -1 || pos >= order.length - 1) { order = buildOrder(); pos = -1; }
-    pos++;
-    const s = order[pos];
+    if (pending) { playlist = pending; pending = null; applyConfig(); order = []; pos = -1; }
+    const s = pickNext();
     if (!s) { showEmpty(); timer = setTimeout(next, 30000); return; }
 
     const { el, media } = render(s);
     let moved = false;
     const go = () => { if (!moved) { moved = true; next(); } };
 
-    if (media) {
-      // 画像・動画が読めなかったら飛ばす
-      media.addEventListener("error", () => setTimeout(go, 300));
-      if (s.type === "video") media.addEventListener("ended", go);
-    }
+    [...stage.children].forEach(retire);
     stage.appendChild(el);
     void el.offsetWidth; // 一度描かせてからフェードを始める（画面が裏に回っていても止まらない書き方）
     el.classList.add("show");
-    // 古いスライドはフェードが終わってから片付ける
-    [...stage.children].forEach((c) => { if (c !== el) { c.classList.remove("show"); setTimeout(() => c.remove(), 1000); } });
 
-    // 動画は終わったら次へ。念のため上限時間も置く
-    const limit = s.type === "video" ? (s.seconds || 600) : seconds(s);
-    timer = setTimeout(go, limit * 1000);
+    const type = s.type || "text";
+    if (type === "image") {
+      // 画像は読み込めてから秒数を数える。15秒たっても読めなければ次へ
+      media.addEventListener("error", () => setTimeout(go, 300));
+      timer = setTimeout(go, 15000);
+      const onLoad = () => { if (moved) return; clearTimeout(timer); timer = setTimeout(go, seconds(s) * 1000); };
+      if (media.complete && media.naturalWidth) onLoad(); else media.addEventListener("load", onLoad, { once: true });
+    } else if (type === "video") {
+      // 動画は終わったら次へ。念のため上限時間も置く（最初の運用では動画は使わない）
+      media.addEventListener("error", () => setTimeout(go, 300));
+      media.addEventListener("ended", go);
+      timer = setTimeout(go, (s.seconds || 120) * 1000);
+    } else {
+      timer = setTimeout(go, seconds(s) * 1000);
+    }
     if (DEBUG) $("debug").textContent = `${s.id}  ${pos + 1}/${order.length}  ${ymd(now())} ${hm(now())}`;
   }
 
   function showEmpty() {
-    stage.innerHTML = "";
-    const { el } = render({ theme: "ai", title: playlist ? playlist.config.pharmacyName || "" : "", body: [] });
-    stage.appendChild(el); el.classList.add("show");
+    [...stage.children].forEach(retire);
+    const { el } = render({ id: "_empty", theme: "ai", title: playlist ? playlist.config.pharmacyName : "", body: [] });
+    stage.appendChild(el); void el.offsetWidth; el.classList.add("show");
   }
 
   function applyConfig() {
-    const c = playlist.config || {};
+    const c = playlist.config;
     $("name").textContent = c.pharmacyName || "";
     $("ticker").textContent = c.ticker || "";
+    updateStatus();
   }
 
-  // ---- 内容（playlist.json）の取り込み。失敗したら前回分で続ける ----
+  // 帯の右に「第◯版・最後に内容を取れた時刻」を出す。開店時の目視確認用
+  function updateStatus() {
+    if (!playlist) return;
+    const v = playlist.config.version ? `第${playlist.config.version}版` : "";
+    let t = "前回の内容で表示中";
+    if (lastOk) {
+      const mins = (Date.now() - lastOk.getTime()) / 60000;
+      t = mins > 30 ? `${hm(lastOk)}から通信なし` : `${hm(lastOk)}取得`;
+    }
+    $("status").textContent = [v, t].filter(Boolean).join("・");
+  }
+
+  // ---- 内容（playlist.json）の取り込み。時間制限つき。失敗したら null ----
   async function fetchPlaylist() {
+    const limit = ((playlist && playlist.config.fetchTimeoutSeconds) || DEFAULTS.fetchTimeoutSeconds) * 1000;
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), limit);
     try {
-      const r = await fetch("playlist.json?t=" + Date.now(), { cache: "no-store" });
+      const r = await fetch("playlist.json?t=" + Date.now(), { cache: "no-store", signal: ctl.signal });
       if (!r.ok) throw new Error("HTTP " + r.status);
       const text = await r.text();
-      const data = JSON.parse(text);
-      if (!data || !Array.isArray(data.slides)) throw new Error("slides がありません");
+      const data = normalize(JSON.parse(text));
+      if (!data) throw new Error("内容の形式が正しくありません");
       try { localStorage.setItem(CACHE_KEY, text); } catch (e) { /* 保存できなくても続ける */ }
+      lastOk = new Date();
       return data;
     } catch (e) {
-      console.warn("playlist.json を読めませんでした:", e.message);
+      console.warn("playlist.json を使えませんでした（前回分で続けます）:", e.message);
       return null;
+    } finally {
+      clearTimeout(t);
     }
   }
 
   function cachedPlaylist() {
-    try { const t = localStorage.getItem(CACHE_KEY); return t ? JSON.parse(t) : null; } catch (e) { return null; }
+    try { const t = localStorage.getItem(CACHE_KEY); return t ? normalize(JSON.parse(t)) : null; } catch (e) { return null; }
   }
 
+  // プレーヤー本体が新しくなっていたら読み直す。古い版が配られている間に何度も読み直さないよう10分あける
+  function checkPlayer(p) {
+    const want = p.config.player;
+    if (!want || want === PLAYER || PREVIEW) return;
+    let last = 0;
+    try { last = Number(localStorage.getItem(RELOAD_KEY)) || 0; } catch (e) { /* なし */ }
+    if (Date.now() - last < 10 * 60 * 1000) return;
+    try { localStorage.setItem(RELOAD_KEY, String(Date.now())); } catch (e) { /* なし */ }
+    location.replace(location.pathname + "?v=" + encodeURIComponent(want));
+  }
+
+  let refreshing = false;
   async function refresh() {
+    if (refreshing) return;
+    refreshing = true;
     const data = await fetchPlaylist();
-    if (data && JSON.stringify(data) !== JSON.stringify(playlist)) pending = data;
+    refreshing = false;
+    updateStatus();
+    if (!data) return;
+    checkPlayer(data);
+    if (JSON.stringify(data) !== JSON.stringify(playlist)) pending = data;
   }
 
-  // ---- 時計と、1日1回のページ読み直し（プレーヤー本体の更新を拾うため）----
+  function scheduleRefresh() {
+    setTimeout(async () => { await refresh(); scheduleRefresh(); }, playlist.config.refreshMinutes * 60 * 1000);
+  }
+
   function tick() {
     const d = now();
     $("clock").textContent = `${d.getMonth() + 1}月${d.getDate()}日（${DOW[d.getDay()]}）${hm(d)}`;
-    const reloadAt = playlist && playlist.config.reloadAt;
-    if (!atParam && reloadAt && hm(d) === reloadAt && lastReloadDay !== ymd(d)) {
-      lastReloadDay = ymd(d);
-      location.reload();
-    }
+    updateStatus();
   }
 
   async function start() {
     if (DEBUG) $("debug").style.display = "block";
-    playlist = (await fetchPlaylist()) || cachedPlaylist();
-    if (!playlist) {
-      playlist = { config: { pharmacyName: "", defaultSeconds: 12, refreshMinutes: 1 }, slides: [] };
+    // 1) 保存してある前回分があれば、通信を待たずにすぐ流し始める
+    playlist = cachedPlaylist();
+    if (playlist) { applyConfig(); next(); }
+    // 2) 新しい内容を取りに行く（時間制限つき）
+    const fresh = await fetchPlaylist();
+    if (fresh) {
+      checkPlayer(fresh);
+      if (!playlist) { playlist = fresh; applyConfig(); next(); }
+      else if (JSON.stringify(fresh) !== JSON.stringify(playlist)) pending = fresh;
     }
-    lastReloadDay = ymd(now()); // 起動した日は読み直さない
-    applyConfig();
+    if (!playlist) { playlist = { config: Object.assign({}, DEFAULTS, { refreshMinutes: 1 }), slides: [] }; applyConfig(); next(); }
     tick();
-    setInterval(tick, 1000 * 15);
-    const every = (playlist.config.refreshMinutes || 5) * 60 * 1000;
-    setInterval(refresh, every);
-    next();
+    setInterval(tick, 15000);
+    scheduleRefresh();
+    // テレビがスタンバイから戻ったときなど、画面が表に出たらすぐ内容を確かめる
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
   }
 
   start();
